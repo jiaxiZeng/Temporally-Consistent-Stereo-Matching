@@ -1,0 +1,21 @@
+CUBLAS_WORKSPACE_CONFIG=:4096:8 NCCL_P2P_DISABLE=1 CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.launch --nproc_per_node=2 --master_port=32679 train_stereo.py \
+--ddp \
+--pth_name kitti_raw \
+--mixed_precision \
+--batch_size 4 \
+--train_dataset kitti_raw \
+--lr 0.0001 \
+--num_steps 60000 \
+--image_size 320 1024 \
+--train_iters 5 \
+--valid_iters 5 \
+--shared_backbone \
+--saturation_range 0.7 1.3 \
+--spatial_scale -0.2 0.2  \
+--name KITTI_RAW \
+--temporal \
+--init_thres 0.5 \
+--frame_length 4 \
+--noyjitter \
+--restore_ckpt ./checkpoints/tartanair.pth \
+--context_norm none
