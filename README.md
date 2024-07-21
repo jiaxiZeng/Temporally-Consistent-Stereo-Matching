@@ -84,7 +84,7 @@ bash sceneflow_evaluate.sh
 ```
 
 ```bash
-bash submit_kitt.sh
+bash submit_kitti.sh
 ```
 
 ## Training
