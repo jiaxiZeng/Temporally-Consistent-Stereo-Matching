@@ -11,14 +11,11 @@
 ![pipeline](./img/pipeline.png "pipeline")
 
 ## Visualization
-<video width="600" controls>
-  <source src="./video/abandonedfactory_Easy_P002.mp4" type="video/mp4">
-  Your browser does not support the video tag.
-</video>
-<video width="600" controls>
-  <source src="./video/demo_kitti.mp4" type="video/mp4">
-  Your browser does not support the video tag.
-</video>
+- **TartanAir**:
+![Video GIF](./video/tinywow_abandonedfactory_Easy_P002.gif)
+
+- **KITTI**:
+![Video GIF](./video/tinywow_demo_kitti.gif)
 
 
 ## Installation
