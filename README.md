@@ -2,9 +2,24 @@
 
 ## News
 
-- **2024.07.06**: ~~The code will be uploaded in a few weeks.~~
+- **2024.07.06**: The code will be uploaded in a few weeks.
 - **2024.07.17**: The [paper](https://arxiv.org/pdf/2407.11950) and [supplementary materials](./pdf/Temporally_Consistent_Stereo_Matching_supp.pdf) are available now.
 - **2024.07.22**: The code is available now. Video demos are coming soon.
+- **2024.09.26**: Video demos are available now.
+
+## Pipeline
+![pipeline](./img/pipeline.png "pipeline")
+
+## Visualization
+<video width="600" controls>
+  <source src="./video/abandonedfactory_Easy_P002.mp4" type="video/mp4">
+  Your browser does not support the video tag.
+</video>
+<video width="600" controls>
+  <source src="./video/demo_kitti.mp4" type="video/mp4">
+  Your browser does not support the video tag.
+</video>
+
 
 ## Installation
 
@@ -84,7 +99,7 @@ bash sceneflow_evaluate.sh
 ```
 
 ```bash
-bash submit_kitt.sh
+bash submit_kitti.sh
 ```
 
 ## Training
@@ -116,7 +131,7 @@ If you find our work useful in your research, please consider citing:
 @article{zeng2024temporally,
   title={Temporally Consistent Stereo Matching},
   author={Zeng, Jiaxi and Yao, Chengtang and Wu, Yuwei and Jia, Yunde},
-  journal={arXiv preprint arXiv:2407.11950},
+  booktitle={European Conference on Computer Vision (ECCV)},
   year={2024}
 }
 ```
