@@ -360,7 +360,7 @@ if __name__ == '__main__':
     parser.add_argument('--uncertainty_threshold', default=0.5, type=float, help='the threshold of uncertainty')
     parser.add_argument('--visualize', action='store_true', help='visualize the results')
     parser.add_argument('--device', default=0, type=int, help='the device id')
-
+    parser.add_argument('--init_thres', type=float, default=0.5, help="the threshold gap of contrastive loss for cost volume.")
     # Architecure choices
     parser.add_argument('--hidden_dims', nargs='+', type=int, default=[128] * 3, help="hidden state and context dimensions")
     parser.add_argument('--shared_backbone', action='store_true', help="use a single backbone for the context and feature encoders")
