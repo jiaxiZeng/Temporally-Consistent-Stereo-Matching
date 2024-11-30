@@ -2,6 +2,8 @@ from __future__ import print_function, division
 import sys
 
 sys.path.append('core')
+import cv2
+import pykitti
 import os
 import wandb
 import argparse
@@ -10,13 +12,13 @@ import skimage
 import logging
 import numpy as np
 import torch
+import torch.nn.functional as F
 from tqdm import tqdm
 from core.tc_stereo import TCStereo, autocast
 import core.stereo_datasets as datasets
-from core.utils.utils import InputPadder
-from core.utils.frame_utils import readDispTartanAir, read_gen
-import cv2
-import pykitti
+from core.utils.utils import InputPadder,bilinear_sampler
+from core.utils.frame_utils import readDispTartanAir, read_gen, readFlowTartanAir
+from core.utils.geo_utils import disp2point,depth2disp,cal_relative_transformation,relative_transform,coords_grid
 from core.utils.visualization import pseudoColorMap
 
 
@@ -116,23 +118,99 @@ def submit_kitti(args, model, iters=32, mixed_prec=False):
     return {'kitti-fps': 1 / (avg_runtime + 1e-5)}
 
 
+def track_disp_error(disp_gt_tar, disp_pred_src, flow_tar2src, baseline, K, T_tar, T_src, disp_mask):
+    """ Track the disparity error from the source frame to the target frame """
+    K_inv = torch.linalg.inv(K)
+    # Disparity to 3d Points
+    points_pred = disp2point(disp_pred_src, baseline, K, K_inv)
+    # source to target transformation
+    T_src2tar = cal_relative_transformation(T_src, T_tar)
+    points_pred_tar = relative_transform(points_pred, T_src2tar)
+    # source disparity to target disparity (numeral)
+    disp_pred_tar = depth2disp(points_pred_tar[:, -1:], baseline, K[:, 0, 0])
+    neg_mask = (disp_pred_tar < 0)  # negative disparity
+    # source disparity to target disparity (alignment)
+    warp_grid = coords_grid(disp_gt_tar.shape[0],disp_gt_tar.shape[2],disp_gt_tar.shape[3]).to(flow_tar2src.device) + flow_tar2src
+    disp_mask = (disp_mask.bool() & ~neg_mask).float()
+    aligned_disp = bilinear_sampler(torch.cat((disp_mask, disp_pred_tar), dim=1), warp_grid.permute(0,2,3,1), align_corners=True)
+    disp_mask, disp_pred_tar = torch.split(aligned_disp, 1, dim=1)
+    disp_mask = (disp_mask == 1)
+    # Disparity Error
+    disp_error = torch.abs(disp_pred_tar - disp_gt_tar)
+
+    return disp_error, disp_pred_tar, disp_mask
+
+def evaluate_temporal_consistency(disp_gt_tar, disp_gt_mask, disp_pred_tar, disp_preds_src, disp_src_masks, flows, baseline, K, T_tar, T_srcs=[], flow_masks=[]):
+    """ Evaluate the temporal consistency of the disparity predictions """
+    assert len(disp_preds_src) == len(flows) == len(T_srcs) == len(flow_masks) == len(disp_src_masks)
+    flow = torch.zeros_like(flows[0])
+    mask = disp_gt_mask
+    epe_tar = torch.abs(disp_gt_tar-disp_pred_tar) # t
+    step = torch.zeros_like(mask)
+    abs_delta_disp_sum = torch.zeros_like(mask)
+    Relu_delta_e_sum = torch.zeros_like(mask)
+    d3_list = []
+    Relu_delta_e_1_list = []  # epe t < epe t+1
+    Relu_delta_e_3_list = []  # epe t < epe t+1
+    Relu_delta_e_5_list = []  # epe t < epe t+1
+
+    for iteri, (disp_pred, flow_i, T_src, flow_mask, disp_src_mask) in enumerate(zip(disp_preds_src, flows, T_srcs, flow_masks, disp_src_masks)):
+        flow = flow + flow_i  # flow from target to source
+        disp_error, disp_pred_src_2_tar, disp_scr2tar_mask = track_disp_error(disp_gt_tar, disp_pred, flow, baseline, K, T_tar, T_src, disp_src_mask.float())
+        mask = mask.bool() & flow_mask.bool() & disp_scr2tar_mask.bool()
+        if torch.count_nonzero(mask.float()) == 0:
+            break
+        step = step + mask.float()
+        abs_delta_disp = torch.abs(disp_pred_src_2_tar-disp_pred_tar) * mask.float()  # t+1
+        epe_diff = (disp_error - epe_tar * mask.float())
+        abs_delta_disp_sum = abs_delta_disp_sum + abs_delta_disp
+        Relu_delta_e_sum = Relu_delta_e_sum + F.relu(epe_diff)
+        d3 = (abs_delta_disp > 3).float()
+        d3_list.append(d3[mask])
+        Relu_delta_e_1_list.append((epe_diff > 1).float()[mask])
+        Relu_delta_e_3_list.append((epe_diff > 3).float()[mask])
+        Relu_delta_e_5_list.append((epe_diff > 5).float()[mask])
+        assert not torch.isnan(abs_delta_disp_sum).any() and not torch.isinf(abs_delta_disp_sum).any()
+    abs_delta_disp_mean = abs_delta_disp_sum / torch.clip(step.float(), min=0.01)
+    assert not torch.isnan(abs_delta_disp_mean).any() and not torch.isinf(abs_delta_disp_mean).any()
+    abs_delta_disp_mean = abs_delta_disp_mean[step > 0].mean().item()
+    Relu_delta_e_mean = Relu_delta_e_sum / torch.clip(step.float(), min=0.01)
+    assert not torch.isnan(Relu_delta_e_mean).any() and not torch.isinf(Relu_delta_e_mean).any()
+    Relu_delta_e_mean = Relu_delta_e_mean[step > 0].mean().item()
+    d3 = torch.concatenate(d3_list)
+    mask_rate = torch.numel(d3) / (disp_gt_tar.shape[2] * disp_gt_tar.shape[3] * len(disp_preds_src))
+    d3 = d3.mean().cpu().item()
+    Relu_delta_e_3 = torch.cat(Relu_delta_e_3_list).mean().cpu().item()
+    Relu_delta_e_1 = torch.cat(Relu_delta_e_1_list).mean().cpu().item()
+    Relu_delta_e_5 = torch.cat(Relu_delta_e_5_list).mean().cpu().item()
+    Relu_delta_e_metrics = {
+        'Relu_delta_e': Relu_delta_e_mean,
+                    'Relu_delta_e_1': Relu_delta_e_1,
+                    'Relu_delta_e_3': Relu_delta_e_3,
+                    'Relu_delta_e_5': Relu_delta_e_5,
+                    }
+    return abs_delta_disp_mean, d3, mask_rate, Relu_delta_e_metrics
+
+
+
+
+
 @torch.no_grad()
 def validate_tartanair(args, model, iters=32, mixed_prec=False):
-    """ Peform validation using the KITTI-2015 (train) split """
+    """ Peform validation using the Tartanair split """
     model.eval()
     aug_params = {}
     # test set
     keyword_list = []
     scene_list = ['abandonedfactory', 'amusement', 'carwelding', 'endofworld', 'gascola', 'hospital', 'office', 'office2',
-                  'oldtown', 'soulcity']  # ablation study
-    part_list = ['P002', 'P007', 'P003', 'P006', 'P001', 'P042', 'P006', 'P004', 'P006', 'P008']
+                  'oldtown', 'soulcity']   # ablation study
+    part_list = ['P002', 'P007', 'P003', 'P006', 'P001', 'P042', 'P006', 'P004', 'P006', 'P002', 'P015', 'P008']
 
     for i, (s, p) in enumerate(zip(scene_list, part_list)):
         keyword_list.append(os.path.join(s, 'Easy', p))
         keyword_list.append(os.path.join(s, 'Hard', p))
 
-    val_dataset = datasets.TartanAir(aug_params, root='datasets', scene_list=scene_list, test_keywords=keyword_list,
-                                     is_test=True, mode='temporal', load_flow=False)
+    val_dataset = datasets.TartanAir(aug_params, root='datasets', scene_list=scene_list, test_keywords=keyword_list, is_test=True, mode='temporal', load_flow=True)
 
     # camera parameters
     K = np.array([[320.0, 0, 320.0],
@@ -142,10 +220,12 @@ def validate_tartanair(args, model, iters=32, mixed_prec=False):
     baseline = torch.tensor(0.25).float().cuda(args.device)[None]
 
     # Evaluate Metrics list
-    out_list, out3_list, epe_list = [], [], []
-
+    out_list, epe_list, abs_delta_d_list = [], [], []
+    out3_list, abs_delta_d3_list = [], []
+    Relu_delta_e_5_list, Relu_delta_e_3_list, Relu_delta_e_1_list = [], [], []
+    Relu_delta_e_list = []
     # load function
-    def load(args, image1, image2, disp_gt, T):
+    def load(args, image1, image2, disp_gt, T, flow_gt):
         # load image & disparity
         image1 = read_gen(image1)
         image2 = read_gen(image2)
@@ -156,26 +236,53 @@ def validate_tartanair(args, model, iters=32, mixed_prec=False):
         image1 = torch.from_numpy(image1).permute(2, 0, 1).float()
         image2 = torch.from_numpy(image2).permute(2, 0, 1).float()
         T = torch.from_numpy(T).float()
+        flow, flow_mask = readFlowTartanAir(flow_gt)
+        flow = torch.from_numpy(flow).permute(2, 0, 1).float()
+        flow_mask = torch.from_numpy(flow_mask)[None].float()
 
         T = T[None].cuda(args.device)
         image1 = image1[None].cuda(args.device)
         image2 = image2[None].cuda(args.device)
+        flow = flow[None].cuda(args.device)  # 1,2,h,w
+        flow_mask = flow_mask[None].cuda(args.device)  # 1,1,h,w
         disp_gt = disp_gt[None].cuda(args.device)  # 1,1,h,w
-        return image1, image2, disp_gt, T
+        return image1, image2, disp_gt, T, flow, flow_mask
+
+    class queue:
+        def __init__(self,k):
+            self.k = k
+            self.queue = [None]*k
+
+        def push(self,x):
+            self.queue.pop(0)
+            self.queue.append(x)
+
+        def get(self):
+            return self.queue
 
     # Testing
     for val_id in tqdm(range(len(val_dataset))):
-        image1_list, image2_list, flow_gt_list, pose_list = val_dataset[val_id]
+        image1_list, image2_list, flow_gt_list, pose_list, flow_list = val_dataset[val_id]
         # temporal parameters
         params = dict()
         flow_q = None
         fmap1 = None
         previous_T = None
+        disp_grad_q = None
+        grad_mask = None
         net_list = None
+        # k frame queue
+        k = args.temporal_window_size
+        disp_gts_queue = queue(k+1)
+        disp_preds_queue = queue(k+1)
+        disp_src_mask_queue = queue(k+1)
+        flows_queue = queue(k+1)
+        flow_masks_queue = queue(k+1)
+        T_srcs_queue = queue(k+1)
 
-        for (image1, image2, disp_gt, T) in tqdm(zip(image1_list, image2_list, flow_gt_list, pose_list)):
+        for (image1, image2, disp_gt, T, flow_gt) in tqdm(zip(image1_list, image2_list, flow_gt_list, pose_list, flow_list)):
             # load
-            image1, image2, disp_gt, T = load(args, image1, image2, disp_gt, T)
+            image1, image2, disp_gt, T, flow_gt, flow_mask = load(args, image1, image2, disp_gt, T, flow_gt)
             padder = InputPadder(image1.shape, divis_by=32)
             imgs, K = padder.pad(image1, image2, K=K_raw)
             image1, image2 = imgs
@@ -185,6 +292,8 @@ def validate_tartanair(args, model, iters=32, mixed_prec=False):
                            'last_disp': flow_q,
                            'last_net_list': net_list,
                            'fmap1': fmap1,
+                           'disp_grad_q': disp_grad_q,
+                           'grad_mask': grad_mask,
                            'baseline': baseline})
 
             with autocast(enabled=mixed_prec):
@@ -197,31 +306,81 @@ def validate_tartanair(args, model, iters=32, mixed_prec=False):
             previous_T = T
             disp_pr, K = padder.unpad(disp_pr, K=K)
 
+            # keep the temporal queue
+            disp_gts_queue.push(disp_gt)
+            disp_preds_queue.push(disp_pr)
+            disp_src_mask_queue.push(disp_gt.abs() < 192)
+            flows_queue.push(flow_gt)
+            flow_masks_queue.push(flow_mask)
+            T_srcs_queue.push(T)
+
+            # temporal epe evaluation
+            if disp_gts_queue.queue[0] is not None:
+                abs_delta_d, abs_delta_d3, Tmask_rate, Relu_delta_e_metics  = evaluate_temporal_consistency(disp_gt_tar=disp_gts_queue.queue[0],
+                                                                      disp_gt_mask=disp_src_mask_queue.queue[0],
+                                                                      disp_pred_tar=disp_preds_queue.queue[0],
+                                                                      disp_preds_src=disp_preds_queue.get()[1:],
+                                                                      disp_src_masks=disp_src_mask_queue.get()[1:],
+                                                                      flows=flows_queue.get()[:-1],
+                                                                      baseline=baseline,
+                                                                      K=K,
+                                                                      T_tar=T_srcs_queue.queue[0],
+                                                                      T_srcs=T_srcs_queue.get()[1:],
+                                                                      flow_masks=flow_masks_queue.get()[:-1])
+                if not np.isnan(abs_delta_d):
+                    abs_delta_d_list.append(np.array([abs_delta_d*Tmask_rate, Tmask_rate]))
+                    Relu_delta_e_list.append(np.array([Relu_delta_e_metics['Relu_delta_e']*Tmask_rate, Tmask_rate]))
+                    abs_delta_d3_list.append(np.array([abs_delta_d3*Tmask_rate, Tmask_rate]))
+                    Relu_delta_e_5_list.append(np.array([Relu_delta_e_metics['Relu_delta_e_5']*Tmask_rate, Tmask_rate]))
+                    Relu_delta_e_3_list.append(np.array([Relu_delta_e_metics['Relu_delta_e_3']*Tmask_rate, Tmask_rate]))
+                    Relu_delta_e_1_list.append(np.array([Relu_delta_e_metics['Relu_delta_e_1']*Tmask_rate, Tmask_rate]))
+
             # epe evaluation
             assert disp_pr.shape == disp_gt.shape, (disp_pr.shape, disp_gt.shape)
             epe = torch.sum((disp_pr.squeeze(0) - disp_gt.squeeze(0)) ** 2, dim=0).sqrt()
 
             epe = epe.flatten()
             val = (disp_gt.squeeze(0).abs().flatten() < 192)
-            if (val == False).all():
-                continue
+
             out = (epe > 1.0).float()[val].mean().cpu().item()
             out3 = (epe > 3.0).float()[val].mean().cpu().item()
             mask_rate = val.float().mean().cpu().item()
             epe_list.append(epe[val].mean().cpu().item())
-            out_list.append(np.array([out * mask_rate, mask_rate]))
-            out3_list.append(np.array([out3 * mask_rate, mask_rate]))
+            out_list.append(np.array([out*mask_rate, mask_rate]))
+            out3_list.append(np.array([out3*mask_rate, mask_rate]))
+    abs_delta_d_list = np.stack(abs_delta_d_list,axis=0)
+    Relu_delta_e_list = np.stack(Relu_delta_e_list,axis=0)
     epe_list = np.array(epe_list)
     out_list = np.stack(out_list, axis=0)
     out3_list = np.stack(out3_list, axis=0)
+    abs_delta_d3_list = np.stack(abs_delta_d3_list, axis=0)
+    Relu_delta_e_5_list = np.stack(Relu_delta_e_5_list, axis=0)
+    Relu_delta_e_3_list = np.stack(Relu_delta_e_3_list, axis=0)
+    Relu_delta_e_1_list = np.stack(Relu_delta_e_1_list, axis=0)
 
+
+    abs_delta_d = np.sum(abs_delta_d_list[:, 0]) / np.sum(abs_delta_d_list[:, 1])
+    Relu_delta_e = np.sum(Relu_delta_e_list[:, 0]) / np.sum(Relu_delta_e_list[:, 1])
     epe = np.mean(epe_list)
     d1 = 100 * np.mean(out_list[:, 0]) / np.mean(out_list[:, 1])
     d3 = 100 * np.mean(out3_list[:, 0]) / np.mean(out3_list[:, 1])
+    abs_delta_d3 = 100 * np.sum(abs_delta_d3_list[:, 0]) / np.sum(abs_delta_d3_list[:, 1])
+    Relu_delta_e_3 = 100 * np.sum(Relu_delta_e_3_list[:, 0]) / np.sum(Relu_delta_e_3_list[:, 1])
+    Relu_delta_e_1 = 100 * np.sum(Relu_delta_e_1_list[:, 0]) / np.sum(Relu_delta_e_1_list[:, 1])
+    Relu_delta_e_5 = 100 * np.sum(Relu_delta_e_5_list[:, 0]) / np.sum(Relu_delta_e_5_list[:, 1])
 
-    print("Validation TartanAir: EPE %f, D1 %f, D3 %f" % (epe, d1, d3))
-    return {'TartanAir-epe': epe, 'TartanAir-d1': d1, 'TartanAir-d3': d3}
-
+    print("Validation TartanAir: EPE %f, abs_delta_d %f, Relu_delta_e %f, D1 %f, D3 %f, abs_delta_d3 %f, Relu_delta_e_5 %f, Relu_delta_e_3 %f, Relu_delta_e_1 %f"
+          % (epe, abs_delta_d, Relu_delta_e, d1, d3, abs_delta_d3, Relu_delta_e_5, Relu_delta_e_3, Relu_delta_e_1))
+    return {'TartanAir-epe': epe,
+            'TartanAir-d1': d1,
+            'TartanAir-d3': d3,
+            'TartanAir-abs_delta_d': abs_delta_d,
+            'TartanAir-abs_delta_d3': abs_delta_d3,
+            'TartanAir-Relu_delta_e_5': Relu_delta_e_5,
+            'TartanAir-Relu_delta_e_3': Relu_delta_e_3,
+            'TartanAir-Relu_delta_e_1': Relu_delta_e_1,
+            'TartanAir-Relu_delta_e': Relu_delta_e,
+            }
 
 @torch.no_grad()
 def validate_things(model, iters=32, mixed_prec=False):
@@ -371,7 +530,8 @@ if __name__ == '__main__':
     parser.add_argument('--slow_fast_gru', action='store_true', help="iterate the low-res GRUs more frequently")
     parser.add_argument('--n_gru_layers', type=int, default=3, help="number of hidden GRU levels")
     parser.add_argument('--temporal', action='store_true', help="temporal mode")  # TODO: MODEL temporal mode
-
+    parser.add_argument('--temporal_window_size', type=int, default=1, help="temporal consistency metric window size")
+    parser.add_argument('--init_thres', type=float, default=0.5, help="the threshold gap of contrastive loss for cost volume.")
     args = parser.parse_args()
 
     # if args.visualize:

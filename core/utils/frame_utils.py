@@ -166,6 +166,12 @@ def readDispTartanAir(file_name):
     valid = disp > 0
     return disp, valid
 
+def readFlowTartanAir(file_path):
+    data = np.load(file_path)
+    mask_path = file_path.replace('flow.npy','mask.npy')
+    mask = np.load(mask_path)
+    mask = (mask == 0).astype(float)
+    return data, maskS
 
 def readDepthTartanAir(file_name):
     depth = np.load(file_name)
