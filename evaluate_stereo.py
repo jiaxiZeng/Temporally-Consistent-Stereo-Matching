@@ -357,7 +357,7 @@ if __name__ == '__main__':
                         choices=["kitti", "things", "TartanAir"])
     parser.add_argument('--mixed_precision', action='store_true', help='use mixed precision')
     parser.add_argument('--valid_iters', type=int, default=32, help='number of flow-field updates during forward pass')
-    parser.add_argument('--uncertainty_threshold', default=0.5, type=float, help='the threshold of uncertainty')
+    parser.add_argument('--init_thres', type=float, default=0.5, help="the threshold gap of contrastive loss for cost volume.")
     parser.add_argument('--visualize', action='store_true', help='visualize the results')
     parser.add_argument('--device', default=0, type=int, help='the device id')
 
