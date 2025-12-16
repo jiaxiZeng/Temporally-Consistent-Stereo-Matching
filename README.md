@@ -73,8 +73,9 @@ datasets
 ├── KITTI  # testing sequences
 │   ├── kitti_seq
 │   │   ├── kitti2015_testings
-│   │   │   ├──000000
-│   │   │   ├── ...
+│   │   │   ├── sequences
+│   │   │   │   ├── 000000
+│   │   │   │   ├── ...
 ```
 
 ## Checkpoints
