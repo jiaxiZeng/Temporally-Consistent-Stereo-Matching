@@ -286,7 +286,7 @@ def train(args):
             model = model.cuda(args.device)
         if args.restore_ckpt is not None:
             logging.info("Loading checkpoint...")
-            checkpoint = torch.load(args.restore_ckpt, map_location=torch.device('cpu'))
+            checkpoint = torch.load(args.restore_ckpt, map_location=torch.device('cpu'), weights_only=True)
             model.load_state_dict(checkpoint['model'], strict=True)
         model = DDP(model, device_ids=[local_rank], output_device=local_rank)
         setup_seed(1234 + torch.distributed.get_rank())
@@ -297,7 +297,7 @@ def train(args):
         if args.restore_ckpt is not None:
             assert args.restore_ckpt.endswith(".pth")
             logging.info("Loading checkpoint...")
-            checkpoint = torch.load(args.restore_ckpt)
+            checkpoint = torch.load(args.restore_ckpt, weights_only=True)
             model.load_state_dict(checkpoint, strict=True)
             logging.info(f"Done loading checkpoint")
 
