@@ -386,7 +386,7 @@ if __name__ == '__main__':
     if args.restore_ckpt is not None:
         assert args.restore_ckpt.endswith(".pth")
         logging.info("Loading checkpoint...")
-        checkpoint = torch.load(args.restore_ckpt)
+        checkpoint = torch.load(args.restore_ckpt, weights_only=True)
         model.load_state_dict(checkpoint['model'], strict=True)
         logging.info(f"Done loading checkpoint")
     model = torch.nn.DataParallel(model, device_ids=[args.device])
